@@ -4,13 +4,16 @@ package archetypes
 
 import Keys._
 import sbt._
-import sbt.Keys.{ target, mainClass, sourceDirectory, streams }
+import sbt.Keys.{ target, mainClass, sourceDirectory, streams, normalizedName }
 import SbtNativePackager._
 import com.typesafe.sbt.packager.linux.{ LinuxFileMetaData, LinuxPackageMapping, LinuxSymlink, LinuxPlugin }
 import com.typesafe.sbt.packager.debian.DebianPlugin
 import com.typesafe.sbt.packager.rpm.RpmPlugin
-//TODO wrap `mappings` to avoid name conflict? Something like `WinswFileMapping` ? I don't know yet how to do this will see later
-import com.typesafe.sbt.packager.windows.Keys.{ mappings }
+import com.typesafe.sbt.packager.windows.WindowsServiceOptions
+import sbt.Keys.mainClass
+import sbt.std.TaskStreams
+
+import scala.xml.PrettyPrinter
 
 /**
  * This class contains the default settings for creating and deploying an archetypical Java application.
@@ -88,33 +91,18 @@ object JavaServerAppPackaging {
    */
   def windowsSettings: Seq[Setting[_]] = {
 
-    //QUESTION : not sure about `Windows` scope.
-    // My original idea was to provide winsw config with MSI but also with ZIP file
-    // Maybe something like :
-    // windows:packageBin -> generate MSI with windows service files but create a separate Windows feature to not install the Windows Service
-    // windows:packageZip -> generate ZIP with windows service files
-
     Seq(
-      //get WinswExe file
-      getWinswExe <<= (target in Windows) map doGetWinswExe,
-      //TODO use batScriptExtraDefines ? Definitly it's not generic enough and this must be review
-      //Create the xml file that go with winsw exe
-      createWinswXml <<= (packageName, Keys.mainClass in Compile, scriptClasspath, target in Windows) map doCreateWinswXml,
-      /*
-       * Mappings exe and xml files
-       */
-      //Exe
-      mappings in Windows <++= (getWinswExe, packageName) map { (file, name) =>
-        for {
-          s <- file.toSeq
-        } yield s -> ("bin/" + name + "_service.exe")
-      },
-      //Xml
-      mappings in Windows <++= (createWinswXml, packageName) map { (file, name) =>
-        for {
-          s <- file.toSeq
-        } yield s -> ("bin/" + name + "_service.xml")
-      })
+      serviceId := None,
+      serviceName := None,
+      serviceDescription := None,
+      serviceNoPid := true,
+      serviceLogmode := Some("rotate"),
+      serviceOnfailure := Some("restart"),
+      serviceExtraXml := None,
+      serviceJavaArgs := None,
+      windowsServiceOptions <<= (serviceId, serviceName, serviceDescription, serviceNoPid, serviceLogmode, serviceOnfailure, serviceExtraXml, serviceJavaArgs) apply WindowsServiceOptions,
+      getWinswExe <<= (target in Windows, streams) map doGetWinswExe,
+      createWinswXml <<= (normalizedName, windowsServiceOptions, target in Windows, scriptClasspath, Keys.mainClass in Compile, streams) map doCreateWinswXml)
   }
 
   /**
@@ -272,6 +260,9 @@ object JavaServerAppPackaging {
    * So far, we only get the exe from jenkins repository (version is fixed to the current latest version 1.16).
    * Current URL is : http://repo.jenkins-ci.org/releases/com/sun/winsw/winsw/1.16/winsw-1.16-bin.exe
    *
+   * Winsw license : https://github.com/kohsuke/winsw/blob/master/LICENSE.txt
+   * See LICENSE_WINSW.md
+   *
    * Original name for this task is `downloadWinsw` but `download` sounds too restrictive. I (Maxence) prefer `get`.
    *
    *
@@ -282,64 +273,99 @@ object JavaServerAppPackaging {
    * 3. Try to find the exe in the project (for example look in /conf or something similar)
    * 4. Give custom path
    */
-  protected def doGetWinswExe(windowsDir: File): Option[File] = {
+  protected def doGetWinswExe(windowsDir: File, streams: TaskStreams[_]): File = {
 
-    //QUESTION laguiz how to get streams.log here ?
-
-    //TODO laguiz we have to also package the license somewhere
-
+    //TODO laguiz we have to also package the license somewhere (license is here : LICENSE_WINSW.md)
+    // Should we also package this file in the generated zip?
     //TODO laguiz give the option to provide the exe from (see scaladoc above for more details on these options)
-    println("DEBUG executing doGetWinswExe(tmpDir: File, normalizedProjectName: String): Option[File]")
-    val uri = s"http://repo.jenkins-ci.org/releases/com/sun/winsw/winsw/1.16/winsw-1.16-bin.exe" //Default URL where we fetch the bin (this could be the out-of-the-box option)
+
+    streams.log.debug("Getting Winsw Exe...")
+    //Default URL where we fetch the bin (this could be the out-of-the-box option)
+    val uri = s"http://repo.jenkins-ci.org/releases/com/sun/winsw/winsw/1.16/winsw-1.16-bin.exe"
     val fileToDownload = url(uri);
     val binFileName = "winsw.exe";
-    val resultFile = windowsDir / "tmp" / "bin" / binFileName;
-    //    if (resultFile.exists()) {
-    //      //FIXME laguiz how to get streams.log here ?
-    //      println("We found service exe. No need to download it again.")
-    //    } else {
-    IO.download(fileToDownload, resultFile)
-    //    }
-    Some(resultFile)
+    val exeFile = windowsDir / "tmp" / "bin" / binFileName;
+    IO.download(fileToDownload, exeFile)
+    streams.log.debug("Winsw exe fetched here : " + exeFile)
+    exeFile
   }
 
   /**
    * Create the Winsw XML file needed by the exe file
-   * Give more options to user
+   *
+   * Java command structure :
+   * `java %JAVA_OPTS% %MY_APP_NAME_OPTS% [noPid] -cp [appClasspath] [mainClass] [javaArgs]`
+   *
+   *
+   *
    */
-  protected def doCreateWinswXml(name: String, mainClass: Option[String], appClasspath: Seq[String] = Seq("*"), windowsDir: File): Option[File] = {
+  protected def doCreateWinswXml(name: String, windowsServiceOptions: WindowsServiceOptions, windowsDir: File, appClasspath: Seq[String] = Seq("*"), mainClass: Option[String], streams: TaskStreams[_]): File = {
 
-    val xmlFileName = name + "_service.xml";
-    val resultFile = windowsDir / "tmp" / "bin" / xmlFileName;
+    streams.log.debug("Creating Winsw Xml file...")
 
-    //TODO laguiz this is specific to play and it should be somewhere else... extra options?
-    val noPid = scala.xml.Unparsed("""-Dpidfile.path="NUL"""")
-    val doubleQuote = scala.xml.Unparsed(""""""")
+    val options = windowsServiceOptions;
+    /*
+     * Variables construction
+     */
+    val xmlFileName = "winsw.xml";
+    val xmlFile = windowsDir / "tmp" / "bin" / xmlFileName;
+    val noPid = if (options.noPid) { Some("""-Dpidfile.path="NUL"""") } else { None }
+    val doubleQuote = """"""";
+    val clazz = mainClass.getOrElse("Main")
 
     //Take all libraries in classpath and create the final Strings with `;` and relative path to `..\lib\`
-    //Here gain this is maybe only specific to Play...
     val relativeAppClasspath =
       appClasspath map {
         (s) => """..\lib\""" + s;
-      } mkString (";")
+      } mkString (";");
+
+    //If not specified serviceId is equals to the normalizedName
+    //QUESTION : how to avoid `name => name`? I was expecting something like `normalizedName apply _` but it does not work
+    val serviceId = options.id.getOrElse(name)
+    /*
+     * Create Sequence of optional arguments
+     */
+
+    //Is there a cleaner way to write this? Or a better idea?
+    val arguments: Seq[Option[String]] = Seq() :+
+      Some("%JAVA_OPTS%") :+
+      Some("%" + JavaAppBatScript.makeEnvFriendlyName(name) + "_OPTS%") :+
+      noPid :+ //Windows Service will manage the java process. This will tell Play to NOT generate the PID file (no issue if JVM crash for instance because the Windows Service monitor the process)
+      Some("-cp") :+
+      Some(doubleQuote + relativeAppClasspath + doubleQuote) :+
+      Some(clazz) :+
+      options.javaArgs
+
+    streams.log.debug(scala.xml.Unparsed(buildArgumentsString(arguments)).toString)
 
     //Basic arguments support
-    //How to provide PID no generation optional? By using a boolean ? By detecting Play project automativally?
+    //Should we use a template maybe? Not sure because here it's pretty easy
     val xml = {
       <service>
-        <id>{ name }</id>
-        <name>{ name }</name>
-        <description>{ name }</description>
+        <id>{ options.id.getOrElse(serviceId) }</id>
+        <name>{ options.name.getOrElse(serviceId) }</name>
+        <description>{ options.description.getOrElse(serviceId) }</description>
         <executable>java</executable>
-        <arguments>-cp { doubleQuote }{ relativeAppClasspath }{ doubleQuote } { noPid } { mainClass.getOrElse("Main") }</arguments>
-        <logmode>rotate</logmode>
-        <onfailure action="restart"/>
+        <arguments>{ scala.xml.Unparsed(buildArgumentsString(arguments)) }</arguments>
+        { if (options.logmode.isDefined) <logmode>{ options.logmode.get }</logmode> }
+        { if (options.onfailure.isDefined) <onfailure action={ options.onfailure.get }/> }
+        { if (options.extraXml.isDefined) options.extraXml.get }
       </service>
     }
 
-    IO.write(resultFile, xml.toString);
+    IO.write(xmlFile, xml.toString);
 
-    Some(resultFile)
+    streams.log.debug("Winsw XML created here : " + xmlFile)
+
+    xmlFile
 
   }
+
+  /*
+   * Following methods are technical helpers used in doCreateWinswXml()
+   * Any better way ?
+   */
+
+  private def buildArgumentsString(arguments: Seq[Option[String]]): String = arguments.flatMap(s => s).filter(s => s.nonEmpty).mkString(" ")
+
 }

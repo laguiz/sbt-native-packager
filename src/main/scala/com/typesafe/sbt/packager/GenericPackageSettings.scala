@@ -112,8 +112,7 @@ trait GenericPackageSettings
         if !file.isDirectory
       } yield {
         //For `editable` replaced startWith by endsWith. Like this it makes more sense to me (for `.conf` files) but not sure
-        //Add boolean for windows services (see ComponentFile)
-        ComponentFile(name, editable = (name endsWith "conf"), isWindowsService = (name endsWith "service.exe"))
+        ComponentFile(name, editable = (name endsWith "conf"))
       }
     val corePackage =
       WindowsFeature(

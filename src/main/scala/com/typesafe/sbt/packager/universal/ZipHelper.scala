@@ -3,6 +3,8 @@ package packager
 package universal
 
 import sbt._
+import java.io._
+import java.util.zip._
 import org.apache.commons.compress.archivers.zip._
 import org.apache.commons.compress.compressors.{
   CompressorStreamFactory,
@@ -69,6 +71,51 @@ object ZipHelper {
         (file, name, perm) <- sources
       } yield FileMapping(file, name, Some(perm))
     archive(mappings.toSeq, outputZip)
+  }
+
+  /**
+   * Add files to an existing zip
+   * @param zipFile The zip to modify
+   * @param files files to include in the zip file (File, Location, Target Name).
+   */
+  def addFilesToExistingZip(zipFile: File, files: Seq[(File, String, String)]) = {
+
+    //Read zip data and create a ZipInputStream (used to read existing entries and copy into new version of the ZIP)
+    //Load in memory so no conflict with existing file
+    val zin = new ZipInputStream(new ByteArrayInputStream(IO.readBytes(zipFile)));
+    //Create ZipOutputStream based on exiting file
+    val out = new ZipOutputStream(new FileOutputStream(zipFile));
+
+    //We copy existing entries based on in memory read zip
+    // Better way? I followed http://www.dzone.com/snippets/adding-files-existing-jar-file.
+    // I tried multiple things to avoid it but it seems that the only way is to copy entries
+    var entry = zin.getNextEntry();
+    while (entry != null) {
+      val originalName = ZipHelper.normalizePath(entry.getName());
+      //Found double `//` in path that create folder named `_` when we extract zip on Windows.
+      // For example it appen in `conf` folder for Play projects.
+      // This is an hack only. It must be fixed before we reach this tasks. Maybe when we are doing the mapping...
+      val name = originalName.replace("//", "/");
+      out.putNextEntry(new ZipEntry(name));
+      out.write(IO.readBytes(zin))
+      entry = zin.getNextEntry();
+    }
+
+    // Close ZipInputStream
+    zin.close();
+
+    // Add new files
+    files map {
+      case (file, path, name) => {
+        out.putNextEntry(new ZipEntry(ZipHelper.normalizePath(path + name)));
+        out.write(IO.readBytes(file))
+        out.closeEntry();
+      }
+    }
+
+    // Close ZipOutputStream
+    out.close();
+
   }
 
   /**
